@@ -1,0 +1,350 @@
+---
+title: 'Spatial models in R: Stan vs INLA'
+author: "Lionel Hertzog"
+date: "27 9 2021"
+output: html_document
+---
+
+To fit spatial models to geo-referenced data, some variables are measured at a set of locations, INLA is a fast and precise option in R. A disadvantage of INLA is that setting up the model and extracting the needed information is at best clunky, see for instance the code needed to predict the fitted spatial effect from the [INLA gitbook](https://becarioprecario.bitbucket.io/spde-gitbook/ch-intro.html#prediction-on-a-grid). Another disadvantage in the context of Bayesian analysis is the difficulty to set and interprete the priors (see again the [gitbook](https://becarioprecario.bitbucket.io/spde-gitbook/ch-intro.html#spde-model-definition)). 
+
+[Stan](https://mc-stan.org/) is a Bayesian platform for statistical analysis that allows users to fit a wide range of models. The type of spatial models fitted by INLA (called [Stochastic Partial Differential Equations](https://becarioprecario.bitbucket.io/spde-gitbook/ch-intro.html#spde-model-definition)) are currently not supported in Stan. Stan does allow to fit Gaussian Process but actually only support one covariance function, [the exponentiated quadratic](https://mc-stan.org/docs/2_27/functions-reference/covariance.html) function while typically the Matern covariance function is used for these types of models.
+
+In this post I will show that we can fit spatial models in Stan that are equivalent to INLA at the cost of speed and estimation of the spatial effect parameters (range and variation of spatial effect), but gaining the opportunity to fit spatial effects in Stan allowing to connect to a wide range of models and easing the pre- and post-processing steps.
+
+
+# SPDE = smooth
+
+The first step to connect Stan and INLA is the demonstration in [this paper](https://link.springer.com/article/10.1007/s13253-019-00377-z) that SPDE models as fitted through INLA can be re-parametrized as smooth terms and fitted as GAMs in mgcv.
+
+The key ideas of the paper are that the $\beta$ associated with the basis functions computed at each points of the mesh can be estimated by:
+
+$$ \beta \sim MVN(0, S) $$
+
+Where *S* is the precision matrix that can be computed from the finite element matrices (C, $G_1$ and $G_2$) and two parameters that estimate the range ($\tau$) and the variance ($\kappa$) of the spatial effect:
+
+$$ S = \tau * (\kappa^4 * C + 2 * \kappa^2 * G_1 + G_2) $$
+
+The $\beta$ are then multiplied by a projection matrix that transfer the results from the mesh to the location of the observations and then an algorithm can be used to estimate the model parameters (REML, MCMC ...). The papers provide code to construct the smooths and fit the SPDE models with mgcv.
+
+It is possible to implement this model directly into Stan, based on the following Stan code:
+
+```{stan}
+data {
+  int<lower=0> N; // number of observations
+  int<lower=0> n_knots; // number of interpolation points on the mesh
+  matrix[n_knots, n_knots] G[3]; // FEM matrices
+  matrix[N, n_knots] A; // projection matrix
+  vector[N] y;
+}
+parameters {
+  real mu;
+  real<lower=0> sigma;
+  real<lower=0> kappa;
+  real<lower=0> tau;
+  vector[n_knots] beta; // smooths coefficient
+  vector[n_knots] alpha; // for non-centered parametrization
+}
+transformed parameters {
+  matrix[n_knots, n_knots] S; // precision matrix
+  matrix[n_knots, n_knots] L; // cholesky decompose
+  S = tau * (G[1] * kappa ^ 4 + G[2] * 2 * kappa ^ 2 + G[3]);
+  L = cholesky_decompose(S);
+  // implies beta ~ MVN(0, S)
+  beta = rep_vector(0, n_knots) + chol2inv(L) * alpha;
+}
+model {
+  alpha ~ std_normal();
+  mu ~ normal(0, 1);
+  sigma ~ lognormal(0, 1);
+  kappa ~ lognormal(0, 1);
+  tau ~ lognormal(0, 1);
+  //beta ~ multi_normal_prec(rep_vector(0, n_knots), S);
+  y ~ normal(mu + A * beta, sigma);
+}
+```
+
+And we can now fit it on simulated data:
+
+```{r}
+# an helper function to generate the data
+gen_data <- function(n = 100, range = 0.5, sigma_spat = 1, sigma_res = 1, mu = 0){
+  # the location of the observations
+  dat <- data.frame(x = runif(n),
+                    y = runif(n))
+  
+  # simulate the spatial field
+  spat <- RandomFields::RFsimulate(RandomFields::RMmatern(1, var = sigma_spat, scale = range),
+                                   x = seq(0, 1, length.out = 100),
+                                   y = seq(0, 1, length.out = 100),
+                                   grid = TRUE)
+  spat_raster <- raster::raster(spat)
+  raster::extent(spat_raster) <- c(0, 1, 0, 1)
+  spat_df <- expand.grid(x = seq(0, 1, length.out = 100),
+                         y = seq(0, 1, length.out = 100))
+  spat_df$spat <- raster::extract(spat_raster, spat_df)
+  
+  # simulate the response
+  dat$resp <- rnorm(n, mu + raster::extract(spat_raster, dat), sigma_res)
+  
+  return(list(field = spat_df,
+              data = dat))
+}
+
+source("~/Programming_stuff/spde_mgcv/mgcv_spde_smooth.R")
+
+dd <- gen_data()
+dat <- dd$data
+spat_field <- dd$field
+
+bnd <- INLA::inla.mesh.segment(matrix(c(0, 0, 1, 0, 1, 1, 0, 1), ncol = 2, byrow = TRUE))
+mesh <- INLA::inla.mesh.2d(boundary = bnd, max.edge = c(0.15, 10))
+sm_term <- mgcv::s(x, y, bs = "spde", xt = mesh)
+sm <- mgcv::smooth.construct(sm_term, dat)
+# the projection matrix
+bs_mat <- mgcv::PredictMat(sm, data = dat[,c("x", "y")])
+
+G <- aperm(array(unlist(sm$S), c(mesh$n, mesh$n, 3)), c(3, 1, 2))
+data_stan <- list(N = nrow(dat),
+                  n_knots = mesh$n,
+                  G = G,
+                  A = bs_mat,
+                  y = dat$resp)
+
+m_stan <- rstan::stan("~/Programming_stuff/spde_mgcv/spde_stan_new.stan",
+               data = data_stan, pars = c("mu", "sigma", "kappa", "tau"))
+```
+
+As of writing this post the fitting is however extremely long, potentially due to the inefficient drawing of the $\beta$'s by using the multi-normal distribution. More efficient sampling would be possible by using the non-centered parametrization with a Cholesky decomposition but this would currently require a matrix inversion of th eprecision matrix which is also less than optimal.
+
+
+
+
+## Smooth = random effect
+
+Another approach to fitting these models is going a step further and recognizing that smooths can be re-parametrized as random effects. You can read this very detailed [blog post](https://www.tjmahr.com/random-effects-penalized-splines-same-thing/) to get all the details. The gist of it is that there is a `mgcv::smooth2random` function to convert smooths to random effects. This is what is used in brms in the background to fit smooth terms. Let's have a closer look under the hood:
+
+```{r}
+brms::make_stancode(resp ~ s(x, y), data = dat)
+```
+
+The spline coefficient (`s_1_1`) are estimated as random effect using a non-central parametrization:
+
+$$ s_1_1 = sds_1_1 * zs_1_1 $$
+$$ zs_1_1 ~ N(0, 1) $$
+Which is equivalent to:
+
+$$ s_1_1 ~ N(0, sds_1_1) $$
+These coefficients are then multiplied by the basis function matrix `Zs_1_1` which is issued from the re-parametrization of the smooths terms.
+
+With this we can fit a model estimating the spatial effect with thin plate regression spline via brms:
+
+```{r}
+m_brms <- brm(resp ~ s(x, y), data = dat)
+```
+
+The estimated coefficients cannot be interpreted as parameters controlling the variance and range of the spatial effect but we can project the fitted model across space and compare the fitted spatial field to the actual one:
+
+```{r}
+spat_field <- dd$field
+spat_field <- cbind(spat_field, posterior_summary(posterior_epred(m_brms, newdata = spat_field)))
+spat_field %>%
+  rename(real = spat,
+         fitted = Estimate) %>%
+  pivot_longer(real:fitted) -> dd_field_brms
+
+ggplot(dd_field_brms, aes(x = x, y = y, fill = value)) +
+  geom_raster(interpolate=TRUE) +
+  facet_wrap(~name) +
+  scale_fill_continuous(type = "viridis")
+```
+
+We see that the thin plate regression spline is catching the broadest spatial trends but not the more smaller scale variations.
+
+## SPDE = smooth = random effect ?
+
+We can also go a step further and use the 
+
+First we need to generate the Stan data:
+
+```{r}
+stan_data <- make_standata(resp ~ s(x, y), dat)
+```
+
+Now generate the prediction data:
+
+```{r}
+stan_pred <- make_standata(spat ~ s(x, y), spat_field)
+```
+
+Since the model will not be fitted via brms we need to slightly change the code to allow prediction on the grid to be generated not after model fitting but during model fitting:
+
+```{r}
+stan_code <- "// generated with brms 2.16.1
+functions {
+}
+data {
+  int<lower=1> N;  // total number of observations
+  int<lower=1> Npred; // number of prediction obs
+  vector[N] Y;  // response variable
+  // data for splines
+  int Ks;  // number of linear effects
+  matrix[N, Ks] Xs;  // design matrix for the linear effects
+  matrix[Npred, Ks] Xspred;
+  // data for spline s(x, y)
+  int nb_1;  // number of bases
+  int knots_1[nb_1];  // number of knots
+  // basis function matrices
+  matrix[N, knots_1[1]] Zs_1_1;
+  matrix[Npred, knots_1[1]] Apred;
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+}
+parameters {
+  real Intercept;  // temporary intercept for centered predictors
+  vector[Ks] bs;  // spline coefficients
+  // parameters for spline s(x, y)
+  // standarized spline coefficients
+  vector[knots_1[1]] zs_1_1;
+  real<lower=0> sds_1_1;  // standard deviations of spline coefficients
+  real<lower=0> sigma;  // dispersion parameter
+}
+transformed parameters {
+  // actual spline coefficients
+  vector[knots_1[1]] s_1_1;
+  // compute actual spline coefficients
+  s_1_1 = sds_1_1 * zs_1_1;
+}
+model {
+  // likelihood including constants
+  if (!prior_only) {
+    // initialize linear predictor term
+    vector[N] mu = Intercept + rep_vector(0.0, N) + Xs * bs + Zs_1_1 * s_1_1;
+    target += normal_lpdf(Y | mu, sigma);
+  }
+  // priors including constants
+  target += student_t_lpdf(Intercept | 3, 1, 2.5);
+  target += student_t_lpdf(sds_1_1 | 3, 0, 2.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 2.5);
+  target += std_normal_lpdf(zs_1_1);
+  target += student_t_lpdf(sigma | 3, 0, 2.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 2.5);
+}
+generated quantities {
+  // actual population-level intercept
+  vector[Npred] mu_pred;
+  real b_Intercept = Intercept;
+  
+  mu_pred = Apred * s_1_1;
+}"
+```
+
+
+
+Then we derive the projection matrix for the SPDE and place it instead of the matrix `Zs_1_1` in the data to pass to Stan:
+
+```{r}
+bnd <- INLA::inla.mesh.segment(matrix(c(0, 0, 1, 0, 1, 1, 0, 1), ncol = 2, byrow = TRUE))
+mesh <- INLA::inla.mesh.2d(boundary = bnd, loc = dat[,c("x", "y")], max.edge = c(0.1, 10))
+sm_term <- mgcv::s(x, y, bs = "spde", xt = mesh)
+sm <- mgcv::smooth.construct(sm_term, dat)
+# the projection matrix
+bs_mat <- mgcv::PredictMat(sm, data = dat[,c("x", "y")])
+Apred <-  mgcv::PredictMat(sm, data = spat_field[,c("x", "y")])
+# place into stan_data
+stan_data$Zs_1_1 <- bs_mat
+stan_data$knots_1[1] <- mesh$n
+stan_data$Npred <- nrow(spat_field)
+stan_data$Xspred <- stan_pred$Xs
+stan_data$Apred <- Apred
+```
+
+Now all is there to fit the model with rstan this time:
+
+```{r}
+m_stan <- rstan::stan(model_code = stan_code,
+                      data = stan_data, 
+                      pars = "mu_pred")
+```
+
+We can gather the data and plot them:
+
+```{r}
+spat_field <- dd$field
+spat_field$fitted <- apply(extract(m_stan)[[1]], 2, median)
+spat_field %>%
+  pivot_longer(spat:fitted) -> dd_field_stan
+
+ggplot(dd_field_stan, aes(x = x, y = y, fill = value)) +
+  geom_raster(interpolate=TRUE) +
+  facet_wrap(~name) +
+  scale_fill_continuous(type = "viridis")
+```
+
+Finally we can also compare it to what INLA would have done:
+
+````{r}
+library(inlabru)
+spde <- inla.spde2.pcmatern(mesh,
+                            prior.range = c(0.5, 0.05),
+                            prior.sigma = c(10, 0.05))
+dat_sp <- dat
+coordinates(dat_sp) <- ~ x + y
+form <- resp ~ Intercept(1) + field(coordinates, model = spde)
+m_inla <- bru(form, data = dat_sp, family = "gaussian")
+```
+
+```{r}
+# derive predictions
+pred_sp <- spat_field
+coordinates(pred_sp) <- ~ x + y
+pred_field <- predict(m_inla, pred_sp,
+                      ~ Intercept + field)
+spat_field$pred <- pred_field$mean
+spat_field %>%
+  pivot_longer(spat:pred) -> dd_field
+
+ggplot(dd_field, aes(x=x, y=y, fill=value)) +
+  geom_raster(interpolate = TRUE) +
+  facet_wrap(~name) +
+  scale_fill_continuous(type="viridis")
+```
+
+Try greta
+
+```{r}
+# data simulation
+dd <- gen_data()
+dat <- dd$data
+spat_field <- dd$field
+
+bnd <- INLA::inla.mesh.segment(matrix(c(0, 0, 1, 0, 1, 1, 0, 1), ncol = 2, byrow = TRUE))
+mesh <- INLA::inla.mesh.2d(boundary = bnd, max.edge = c(0.15, 10))
+sm_term <- mgcv::s(x, y, bs = "spde", xt = mesh)
+sm <- mgcv::smooth.construct(sm_term, dat)
+# the projection matrix
+bs_mat <- mgcv::PredictMat(sm, data = dat[,c("x", "y")])
+
+G <- aperm(array(unlist(sm$S), c(mesh$n, mesh$n, 3)), c(3, 1, 2))
+
+k <- mesh$n
+y <- dat$resp
+
+# priors
+mu <- normal(0, 2.5)
+sigma <- lognormal(0, 1)
+tau <- normal(0, 1, truncation = c(0, Inf))
+kappa <- cauchy(0, 5, truncation = c(0, Inf))
+
+S <- tau * (G[1,,] * kappa ** 4 + 2 * G[2,,] * kappa ** 2 + G[3,,])
+L <- chol(S)
+O <- greta::chol2inv(L)
+
+beta <- multivariate_normal(t(rep(0, k)), O)
+
+linpred <- mu + bs_mat %*% t(beta)
+distribution(y) <- normal(linpred, sigma)
+
+mm <- model(mu, sigma, tau, kappa)
+fit <- mcmc(mm, one_by_one = TRUE)
+```
